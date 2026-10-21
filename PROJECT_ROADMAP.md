@@ -55,7 +55,7 @@ jev replies: "done — volume at 30, Spotify's on 🎵"
 
 ---
 
-### Phase 1 — Jev Decision Layer ⭐ **THIS IS WHERE JEV (THE MODEL) APPEARS**
+### Phase 1 — Two-Model Decision Layer ✅ DONE
 **Goal:** Wire your tool functions to Jev so the model decides which to call.
 **Requires:** `TYPESAFE_API_KEY` from console.typesafe.ai/keys + `pip install typesafe-sdk`
 
@@ -181,13 +181,13 @@ TTS → "done, volume at 30"
 
 | Phase | Features Done | Status |
 |---|---|---|
-| 0 — Foundation | 2/10 (volume, open_app) | 🔧 IN PROGRESS |
-| 1 — Jev Decision Layer | 0/6 | ⏳ BLOCKED (need API key) |
-| 2 — System Senses | 0/4 | ⏳ PENDING |
-| 3 — Memory | 0/4 | ⏳ PENDING |
-| 4 — Proactive Cron | 0/4 | ⏳ PENDING |
-| 5 — Voice | 0/3 | ⏳ PENDING |
-| 6 — Telegram Gateway | 0/4 | ⏳ PENDING |
+|| 0 — Foundation | 10/10 | ✅ DONE |
+|| 1 — Two-Model Layer | 4/6 | ✅ DONE (DeepSeek + Jev working) |
+|| 2 — System Senses | 0/4 | ⏳ PENDING |
+|| 3 — Memory | 0/4 | ⏳ PENDING |
+|| 4 — Proactive Cron | 0/4 | ⏳ PENDING |
+|| 5 — Voice | 0/3 | ⏳ PENDING |
+|| 6 — Telegram Gateway | 0/4 | ⏳ PENDING ||
 
 ---
 
@@ -226,5 +226,5 @@ TTS → "done, volume at 30"
 
 ---
 
-*Last updated: Oct 20, 2026*
-*Next action: finish quit_app + battery in jev_tools.py*
+*Last updated: Oct 21, 2026*
+*Phase 0 + Phase 1 complete. Next: Phase 2 (System Senses)*
