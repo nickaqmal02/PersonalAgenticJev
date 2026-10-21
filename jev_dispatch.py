@@ -117,6 +117,35 @@ def extract_level(text: str) -> int | None:
     return None
 
 
+def validate_with_jev(user_text: str, expected_tool: str | None = None) -> dict:
+    """
+    Ask Jev to validate a tool choice WITHOUT executing.
+
+    Used by jev_brain.py as the second model in the two-model pipeline:
+    DeepSeek picks the tool, Jev validates it.
+
+    Returns: {"tool": str, "confidence": float, "actionable": float}
+    """
+    api_key = os.environ.get("TYPESAFE_API_KEY")
+    if not api_key or api_key == "your_key_here":
+        return {"tool": expected_tool or "unknown", "confidence": 0.0, "actionable": 0.0}
+
+    with TypeSafeClient() as client:
+        result = client.system_one(
+            state=user_text,
+            questions={
+                "tool": build_tool_question(),
+                "actionable": Noul(instructions="Is this a real command to act on, or just conversation?"),
+            },
+        )
+
+        return {
+            "tool": result.choices["tool"].choice,
+            "confidence": result.choices["tool"].confidence,
+            "actionable": result.nouls["actionable"].noul,
+        }
+
+
 def dispatch(user_text: str, confirm_threshold: float = 0.7) -> str:
     """
     Send user text to Jev, get a typed decision, execute the tool.

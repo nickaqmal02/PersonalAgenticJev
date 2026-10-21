@@ -35,7 +35,7 @@ jev replies: "done — volume at 30, Spotify's on 🎵"
 
 ## Phase Breakdown
 
-### Phase 0 — Foundation (NOW) 
+### Phase 0 — Foundation ✅ DONE
 **Goal:** Build the tools layer. Pure Python, stdlib-only, no API key needed.
 
 | Feature | Status | Notes |
