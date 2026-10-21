@@ -3,17 +3,15 @@ Jev Voice — Phase 5 (Voice)
 
 Speak to Jev, Jev speaks back.
 
+Two modes:
+  1. Push-to-talk (default): press ENTER → speak → press ENTER again → transcribe
+  2. Auto silence: record until 2s of silence detected
+
 Pipeline:
-    1. Press ENTER → record audio from mic (silence detection stops)
+    1. Record audio from mic
     2. Transcribe with faster-whisper (local, no API key)
     3. Feed transcript to jev_brain.think() → DeepSeek + Jev pipeline
     4. Speak the reply with edge-tts (free, no API key)
-
-Requirements (already installed in .venv):
-    - faster-whisper (local STT, model downloads on first run ~150MB)
-    - edge-tts (free TTS via Microsoft Edge)
-    - sounddevice + numpy (mic recording)
-    - ffmpeg (already installed via brew)
 """
 
 import os
@@ -21,7 +19,7 @@ import sys
 import wave
 import tempfile
 import asyncio
-import struct
+import threading
 
 # --- .env loader ---
 def load_env(path: str) -> None:
@@ -44,41 +42,40 @@ import edge_tts
 
 
 # ─── Config ───────────────────────────────────────────────────────
-SAMPLE_RATE = 16000          # Whisper wants 16kHz
+SAMPLE_RATE = 16000
 CHANNELS = 1
-SILENCE_THRESHOLD = 0.01    # RMS below this = silence
-SILENCE_DURATION = 2.0       # seconds of silence before stopping
-MAX_RECORDING_SECONDS = 15   # safety cap
-WHISPER_MODEL = "base"       # tiny|base|small|medium|large|turbo (base = good + fast)
-TTS_VOICE = "en-US-GuyNeural"  # male voice (change to en-US-AriaNeural for female)
-TTS_RATE = "+0%"             # speed: -10% slower, +10% faster
+GAIN_BOOST = 10.0            # amplify mic input (macOS built-in mic is quiet)
+SILENCE_THRESHOLD = 0.015
+SILENCE_DURATION = 2.0
+MAX_RECORDING_SECONDS = 15
+WHISPER_MODEL = "base"
+TTS_VOICE = "en-US-GuyNeural"
+TTS_RATE = "+0%"
+USE_PUSH_TO_TALK = True      # True = press ENTER to stop, False = auto silence
 
-# ─── STT: Record + Transcribe ──────────────────────────────────────
 
-def record_audio() -> str:
-    """Record from mic until silence detected. Return path to WAV file."""
-    print("🎤 Listening... (speak now)")
+# ─── Recording ───────────────────────────────────────────────────
+
+def record_audio_push_to_talk() -> str:
+    """Push-to-talk: press ENTER to start, press ENTER to stop."""
+    input("  Press ENTER to start recording, then speak...")
+    print("  🎤 Recording... (press ENTER to stop)")
 
     frames = []
-    silence_start = None
-    recording_start = None
+    stop_flag = threading.Event()
+
+    # Listen for ENTER in a background thread
+    def wait_for_enter():
+        input()
+        stop_flag.set()
+
+    listener = threading.Thread(target=wait_for_enter, daemon=True)
+    listener.start()
 
     def callback(indata, frame_count, time_info, status):
-        nonlocal silence_start, recording_start
-        if recording_start is None:
-            recording_start = time_info.inputBufferAdcTime
-
-        frames.append(indata.copy())
-
-        # Check for silence
-        rms = np.sqrt(np.mean(indata**2))
-        if rms < SILENCE_THRESHOLD:
-            if silence_start is None:
-                silence_start = time_info.inputBufferAdcTime
-            elif time_info.inputBufferAdcTime - silence_start > SILENCE_DURATION:
-                raise sd.CallbackStop
-        else:
-            silence_start = None
+        boosted = indata.copy() * GAIN_BOOST
+        boosted = np.clip(boosted, -1.0, 1.0)
+        frames.append(boosted)
 
     try:
         with sd.InputStream(
@@ -89,63 +86,121 @@ def record_audio() -> str:
             blocksize=1024,
         ) as stream:
             stream.start()
-            # Timeout safety
             import time
             start = time.time()
-            while stream.active and (time.time() - start) < MAX_RECORDING_SECONDS:
-                time.sleep(0.1)
-    except sd.CallbackStop:
-        pass  # normal — silence detected
+            while stream.active and not stop_flag.is_set() and (time.time() - start) < MAX_RECORDING_SECONDS:
+                time.sleep(0.05)
     except Exception as e:
         print(f"  Mic error: {e}")
         return ""
 
     if not frames:
+        print("  (no audio captured)")
         return ""
 
-    # Concatenate all frames
     audio = np.concatenate(frames, axis=0)
+    rms = np.sqrt(np.mean(audio**2))
+    print(f"  📊 Audio level: {rms:.4f} ({'good' if rms > 0.02 else 'quiet'})")
 
-    # Save as WAV
+    return save_wav(audio)
+
+
+def record_audio_auto() -> str:
+    """Auto: record until silence detected."""
+    print("  🎤 Listening... (speak now)")
+
+    frames = []
+    silence_start = None
+    heard_speech = False
+
+    def callback(indata, frame_count, time_info, status):
+        nonlocal silence_start, heard_speech
+        boosted = np.clip(indata.copy() * GAIN_BOOST, -1.0, 1.0)
+        frames.append(boosted)
+        rms = np.sqrt(np.mean(boosted**2))
+        if rms > SILENCE_THRESHOLD:
+            heard_speech = True
+            silence_start = None
+        elif heard_speech:
+            if silence_start is None:
+                silence_start = time_info.inputBufferAdcTime
+            elif time_info.inputBufferAdcTime - silence_start > SILENCE_DURATION:
+                raise sd.CallbackStop
+
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32", callback=callback, blocksize=1024) as stream:
+            stream.start()
+            import time
+            start = time.time()
+            while stream.active and (time.time() - start) < MAX_RECORDING_SECONDS:
+                time.sleep(0.1)
+    except sd.CallbackStop:
+        pass
+    except Exception as e:
+        print(f"  Mic error: {e}")
+        return ""
+
+    if not frames or not heard_speech:
+        print("  (no speech detected)")
+        return ""
+
+    audio = np.concatenate(frames, axis=0)
+    return save_wav(audio)
+
+
+def save_wav(audio: np.ndarray) -> str:
+    """Save numpy audio to WAV file."""
     wav_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
     with wave.open(wav_path, "w") as wf:
         wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)  # 16-bit
+        wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
-        # Convert float32 to int16
         audio_int = (audio * 32767).astype(np.int16)
         wf.writeframes(audio_int.tobytes())
-
     return wav_path
 
 
+def record_audio() -> str:
+    """Record audio — push-to-talk or auto mode."""
+    if USE_PUSH_TO_TALK:
+        return record_audio_push_to_talk()
+    return record_audio_auto()
+
+
+# ─── Transcription ────────────────────────────────────────────────
+
 def transcribe(wav_path: str, model: WhisperModel) -> str:
-    """Transcribe WAV file to text using faster-whisper.
-
-    faster-whisper can accept a numpy array directly, avoiding the av library
-    bug. We read the WAV with the stdlib wave module + numpy.
-    """
-    import wave
-    import numpy as np
-
+    """Transcribe WAV → text with faster-whisper (numpy array, bypass av bug)."""
     with wave.open(wav_path, "rb") as wf:
         frames = wf.readframes(wf.getnframes())
-        sample_rate = wf.getframerate()
 
-    # Convert bytes to float32 numpy array (what faster-whisper expects)
     audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
 
-    # faster-whisper accepts numpy array directly
-    segments, _ = model.transcribe(audio, language="en")
+    # VAD: trim leading/trailing silence
+    # Find where speech starts and ends
+    window = 1600  # 100ms windows
+    speech_windows = []
+    for i in range(0, len(audio) - window, window):
+        chunk = audio[i:i+window]
+        rms = np.sqrt(np.mean(chunk**2))
+        if rms > 0.005:  # lower threshold for VAD
+            speech_windows.append(i)
+
+    if speech_windows:
+        start = max(0, speech_windows[0] - window)
+        end = min(len(audio), speech_windows[-1] + window * 2)
+        audio = audio[start:end]
+        print(f"  ✂️ Trimmed to speech: {start/16000:.1f}s - {end/16000:.1f}s")
+
+    segments, _ = model.transcribe(audio, language="en", beam_size=5, best_of=3)
     text = " ".join(segment.text for segment in segments).strip()
     return text
 
 
-# ─── TTS: Speak the reply ─────────────────────────────────────────
+# ─── TTS ─────────────────────────────────────────────────────────
 
 async def speak(text: str) -> None:
     """Convert text to speech and play it."""
-    # Clean text for TTS (remove emojis, markdown)
     clean = text
     for char in "✅❌⚠️🤔🧠🎵":
         clean = clean.replace(char, "")
@@ -153,33 +208,30 @@ async def speak(text: str) -> None:
     if not clean:
         return
 
-    # Generate audio
     mp3_path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
     communicate = edge_tts.Communicate(clean, TTS_VOICE, rate=TTS_RATE)
     await communicate.save(mp3_path)
-
-    # Play with afplay (macOS built-in)
     os.system(f"afplay {mp3_path}")
-
-    # Clean up
     os.unlink(mp3_path)
 
 
-# ─── Main Voice Loop ──────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────
 
 def main():
-    # Load Whisper model (downloads on first run ~150MB)
     print(f"Loading Whisper model '{WHISPER_MODEL}'...")
     model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     print("Whisper ready.\n")
 
-    # Import jev_brain (the two-model pipeline)
     sys.path.insert(0, os.path.dirname(__file__))
     from jev_brain import think
 
     print("=" * 50)
-    print("  Jev Voice v0.1")
-    print("  Press ENTER to speak, type 'quit' to exit")
+    print("  Jev Voice v0.2")
+    if USE_PUSH_TO_TALK:
+        print("  Press ENTER to start, ENTER to stop recording")
+    else:
+        print("  Press ENTER to start (auto-stops on silence)")
+    print("  Type 'quit' to exit")
     print("=" * 50)
 
     while True:
@@ -190,36 +242,33 @@ def main():
             break
 
         if user_input.lower() in ("quit", "exit", "q"):
-            print("Bye!")
             break
 
-        if user_input == "":
-            # Voice mode — record + transcribe
+        if user_input:
+            # Text input — skip recording
+            pass
+        else:
+            # Voice mode
             wav_path = record_audio()
             if not wav_path:
-                print("  (no audio captured)")
                 continue
 
             transcript = transcribe(wav_path, model)
-            os.unlink(wav_path)  # clean up
+            os.unlink(wav_path)
 
             if not transcript:
-                print("  (didn't catch that)")
+                print("  (didn't catch that — try again, speak louder)")
                 continue
 
-            print(f"  📝 You said: \"{transcript}\"")
+            print(f'  📝 You said: "{transcript}"')
 
             if transcript.lower() in ("quit", "exit", "stop", "goodbye"):
-                print("Bye!")
                 break
 
             user_input = transcript
 
-        # Run through the two-model pipeline
         result = think(user_input)
         print(f"  {result}")
-
-        # Speak the reply
         print("  🔊 Speaking...")
         asyncio.run(speak(result))
 
