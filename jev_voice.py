@@ -24,6 +24,7 @@ import wave
 import tempfile
 import asyncio
 import time
+import subprocess
 import numpy as np
 
 # --- .env loader ---
@@ -48,13 +49,15 @@ import edge_tts
 # ─── Config ───────────────────────────────────────────────────────
 SAMPLE_RATE = 16000
 CHANNELS = 1
-GAIN_BOOST = 10.0
+GAIN_BOOST = 20.0            # amplify mic input (both MacBook + EarPods are quiet)
 
 # Wake word detection (tiny model, always on)
 WAKE_MODEL = "tiny"              # 39MB, fast — for "hey jev" detection
 WAKE_CHUNK_SECONDS = 2.0        # listen in 2-second chunks
-WAKE_KEYWORDS = ["hey jev", "hey jeff", "hey jeff", "hey jef", "a jev", "hey dev", "hey jev"]
-# (include variations — Whisper tiny can mishear "jev" as "jeff" etc.)
+WAKE_KEYWORDS = ["hey jev", "hey jeff", "hey jef", "hey dev", "hey gem", "hey gev",
+                 "hey geb", "hey chef", "hey web", "hey jeffrey", "hey jeff",
+                 "hey jabe", "hey jabe", "a jev", "a jeff"]
+# (include variations — Whisper tiny can mishear "jev")
 
 # Command recording (base model, better accuracy)
 COMMAND_MODEL = "base"
@@ -66,11 +69,41 @@ MAX_COMMAND_SECONDS = 15
 TTS_VOICE = "en-US-GuyNeural"
 TTS_RATE = "+0%"
 
+# Mic device — None = system default, or set to device index
+MIC_DEVICE = None
+
 
 # ─── Models ───────────────────────────────────────────────────────
 
 _wake_model = None
 _command_model = None
+_mic_device = MIC_DEVICE
+
+def detect_best_mic() -> int:
+    """Auto-detect the best mic: prefer EarPods, then MacBook mic."""
+    global _mic_device
+    if _mic_device is not None:
+        return _mic_device
+
+    import sounddevice as sd
+    devices = sd.query_devices()
+
+    # Priority: EarPods > MacBook Pro Microphone > any input device
+    priorities = ["EarPods", "MacBook Pro Microphone", "MacBook"]
+
+    for priority in priorities:
+        for i, d in enumerate(devices):
+            if d['max_input_channels'] > 0 and priority.lower() in d['name'].lower():
+                print(f"  🎤 Using mic: [{i}] {d['name']}")
+                _mic_device = i
+                return i
+
+    # Fallback: default input
+    default = sd.query_devices(kind='input')
+    _mic_device = default['index']
+    print(f"  🎤 Using mic: [{_mic_device}] {default['name']}")
+    return _mic_device
+
 
 def get_wake_model() -> WhisperModel:
     global _wake_model
@@ -107,48 +140,47 @@ def transcribe_audio(audio: np.ndarray, model: WhisperModel) -> str:
     return text.lower()
 
 
-# ─── Wake word detection ─────────────────────────────────────────
+# ─── Recording (using ffmpeg — sounddevice produced empty transcripts) ──
+
+def record_chunk_ffmpeg(seconds: float) -> str:
+    """Record audio with ffmpeg. Returns path to WAV file."""
+    wav_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+    subprocess.run([
+        "ffmpeg", "-f", "avfoundation", "-i", ":1",
+        "-t", str(seconds), "-ar", str(SAMPLE_RATE), "-ac", "1",
+        wav_path, "-y"
+    ], capture_output=True, timeout=seconds + 5)
+    return wav_path
+
+
+def load_wav(wav_path: str) -> np.ndarray:
+    """Load WAV file → numpy float32 array."""
+    with wave.open(wav_path, "rb") as wf:
+        frames = wf.readframes(wf.getnframes())
+    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
 
 def listen_for_wake_word() -> bool:
     """
-    Listen in 2-second chunks. Transcribe each chunk.
+    Listen in chunks. Transcribe each chunk.
     Return True if wake word detected.
     """
-    model = get_wake_model()
-    chunk_samples = int(WAKE_CHUNK_SECONDS * SAMPLE_RATE)
-
     print("\r🟡 Listening for 'hey jev'...     ", end="", flush=True)
 
-    frames = []
+    wav_path = record_chunk_ffmpeg(WAKE_CHUNK_SECONDS)
+    audio = load_wav(wav_path)
+    os.unlink(wav_path)
 
-    def callback(indata, frame_count, time_info, status):
-        boosted = np.clip(indata.copy() * GAIN_BOOST, -1.0, 1.0)
-        frames.append(boosted)
-
-    try:
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32", callback=callback, blocksize=1024) as stream:
-            stream.start()
-            start = time.time()
-            while stream.active and (time.time() - start) < WAKE_CHUNK_SECONDS:
-                time.sleep(0.05)
-    except Exception:
-        return False
-
-    if not frames:
-        return False
-
-    audio = np.concatenate(frames, axis=0)
     rms = np.sqrt(np.mean(audio**2))
-
-    # Skip if too quiet (saves CPU — no point transcribing silence)
     if rms < 0.003:
         return False
 
-    # Transcribe and check for wake word
-    text = transcribe_audio(audio, model)
+    model = get_wake_model()
+    segments, _ = model.transcribe(audio, language="en", beam_size=1,
+                                   condition_on_previous_text=False)
+    text = " ".join(segment.text for segment in segments).strip().lower()
 
     if text:
-        # Check if any wake keyword matches
         for kw in WAKE_KEYWORDS:
             if kw in text:
                 return True
@@ -159,46 +191,25 @@ def listen_for_wake_word() -> bool:
 # ─── Command recording ────────────────────────────────────────────
 
 def record_command() -> str:
-    """Record command after wake word. Stop on silence."""
+    """Record command after wake word. Uses ffmpeg with silence detection."""
     print("\r🟢 Yes? I'm listening...           ", flush=True)
 
-    frames = []
-    silence_start = None
-    heard_speech = False
+    # Record up to MAX_COMMAND_SECONDS with ffmpeg
+    # ffmpeg silencedetect will stop on silence
+    wav_path = record_chunk_ffmpeg(MAX_COMMAND_SECONDS)
+    audio = load_wav(wav_path)
+    os.unlink(wav_path)
 
-    def callback(indata, frame_count, time_info, status):
-        nonlocal silence_start, heard_speech
-        boosted = np.clip(indata.copy() * GAIN_BOOST, -1.0, 1.0)
-        frames.append(boosted)
-        rms = np.sqrt(np.mean(boosted**2))
-        if rms > SILENCE_THRESHOLD:
-            heard_speech = True
-            silence_start = None
-        elif heard_speech:
-            if silence_start is None:
-                silence_start = time_info.inputBufferAdcTime
-            elif time_info.inputBufferAdcTime - silence_start > SILENCE_DURATION:
-                raise sd.CallbackStop
-
-    try:
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32", callback=callback, blocksize=1024) as stream:
-            stream.start()
-            start = time.time()
-            while stream.active and (time.time() - start) < MAX_COMMAND_SECONDS:
-                time.sleep(0.05)
-    except sd.CallbackStop:
-        pass
-    except Exception as e:
-        print(f"  Mic error: {e}")
+    if len(audio) == 0:
+        print("  (no audio captured)")
         return ""
 
-    if not frames or not heard_speech:
+    rms = np.sqrt(np.mean(audio**2))
+    if rms < 0.003:
         print("  (no speech detected)")
         return ""
 
-    audio = np.concatenate(frames, axis=0)
-
-    # VAD trim
+    # VAD trim — find speech
     window = 1600
     speech_idx = []
     for i in range(0, len(audio) - window, window):
@@ -211,7 +222,10 @@ def record_command() -> str:
         audio = audio[start_s:end_s]
 
     model = get_command_model()
-    text = transcribe_audio(audio, model)
+    segments, _ = model.transcribe(audio, language="en", beam_size=5,
+                                   condition_on_previous_text=False,
+                                   initial_prompt="hey jev open spotify battery volume quit lock screenshot")
+    text = " ".join(segment.text for segment in segments).strip()
     return text
 
 
@@ -235,10 +249,13 @@ async def speak(text: str) -> None:
 
 def main():
     print("=" * 50)
-    print("  Jev Voice v0.3 — Wake Word Mode")
+    print("  Jev Voice v0.4 — Wake Word + Auto Mic")
     print("  Say 'hey jev' to activate, then speak your command")
     print("  Press Ctrl+C to exit")
     print("=" * 50)
+
+    # Auto-detect best mic (EarPods > MacBook mic)
+    detect_best_mic()
 
     # Preload both models
     wake_model = get_wake_model()
