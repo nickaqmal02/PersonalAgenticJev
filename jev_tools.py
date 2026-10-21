@@ -17,7 +17,9 @@ def open_app(name: str) -> str:
     return f"{name} opened"
 
 def quit_app(name: str) -> str:
-    """"Quit a running macOS application by name""""
+    """Quit a running macOS application by name."""
     subprocess.run(
-        
+        ["osascript", "-e", f'tell application "{name}" to quit'],
+        check=True,
     )
+    return f"{name} quit"
